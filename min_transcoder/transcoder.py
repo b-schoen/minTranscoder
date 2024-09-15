@@ -5,29 +5,17 @@ is in turn mostly from Authur Conmy's https://github.com/ArthurConmy/sae/blob/ma
 
 """
 
-import gzip
-import os
-import pickle
-from functools import partial
 import dataclasses
 
 import einops
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from jaxtyping import Float
 from torch import Tensor, nn
-from torch.distributions.categorical import Categorical
-from tqdm import tqdm
-import transformer_lens
-import transformer_lens.hook_points
-
-# from .geom_median.src.geom_median.torch import compute_geometric_median
+import math
 
 from jaxtyping import Float, jaxtyped
 from typeguard import typechecked as typechecker
-
-# TODO(bschoen): Move save / load related functions to utils
-# TODO(bschoen): Without hooked transformer?
 
 
 @dataclasses.dataclass
@@ -50,46 +38,61 @@ class TranscoderConfig:
 
 @dataclasses.dataclass
 class TranscoderResults:
+    """
+    Dataclass to store the results of the Transcoder forward pass.
+
+    Attributes:
+        transcoder_out (Tensor): The output tensor after the transcoder operation.
+        hidden_activations (Tensor): Activations from the hidden layer.
+    """
+
     transcoder_out: Float[Tensor, "... d_out"]
     hidden_activations: Float[Tensor, "... d_hidden"]
 
 
-class Transcoder(transformer_lens.hook_points.HookedRootModule):
+class Transcoder(nn.Module):
     """
+    Transcoder model for transforming inputs between different representations.
+
+    The Transcoder consists of an encoder, a non-linear activation (ReLU), and a
+    decoder.
+
+    This is largely a minimal implementation of [Transcoders Find Interpretable LLM
+    Feature Circuits](https://arxiv.org/pdf/2406.11944) and the corresponding
+    codebase.
 
     Note:
-        For simplicity, we remove:
-        - resample_neurons_anthropic
-        - collect_anthropic_resampling_losses
-        - resample_neurons_l2
-        - initialize w/ geometric median
+        For simplicity, we have omitted certain methods related to resampling neurons
+        and geometric median initialization.
 
+        Specifically, we've removed:
+            - resample_neurons_anthropic
+            - collect_anthropic_resampling_losses
+            - resample_neurons_l2
+            - initialize with geometric median
     """
 
     def __init__(
         self,
         cfg: TranscoderConfig,
     ) -> None:
+        """
+        Initialize the Transcoder model.
 
+        Args:
+            cfg (TranscoderConfig): Configuration object containing model parameters.
+        """
         super().__init__()
 
+        # Store configuration and dimensions from the provided cfg
         self.cfg = cfg
-        self.d_in = cfg.d_in
+        self.d_in = cfg.d_in  # Input dimension
+        self.d_hidden = cfg.d_hidden  # Hidden layer dimension
+        self.d_out = cfg.d_out  # Output dimension
+        self.dtype = cfg.dtype  # Data type for tensors
+        self.device = cfg.device  # Device to run the model on
 
-        if not isinstance(self.d_in, int):
-            raise ValueError(
-                f"d_in must be an int but was {self.d_in=}; {type(self.d_in)=}"
-            )
-        self.d_hidden = cfg.d_hidden
-        self.dtype = cfg.dtype
-        self.device = cfg.device
-
-        # transcoder stuff
-        self.d_out = self.d_in
-        self.d_out = cfg.d_out
-
-        # NOTE: if using resampling neurons method, you must ensure that we initialise
-        #       the weights in the order W_enc, b_enc, W_dec, b_dec
+        # Initialize the encoder weight matrix (W_enc) with Kaiming Uniform initialization
         self.W_enc: Float[Tensor, "d_in d_hidden"] = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(
@@ -97,9 +100,12 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
                     self.d_hidden,
                     dtype=self.dtype,
                     device=self.device,
-                )
+                ),
+                a=0,
             )
         )
+
+        # Initialize the encoder bias vector (b_enc) with zeros
         self.b_enc: Float[Tensor, "d_hidden"] = nn.Parameter(
             torch.zeros(
                 self.d_hidden,
@@ -108,6 +114,7 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
             )
         )
 
+        # Initialize the decoder weight matrix (W_dec) with Kaiming Uniform initialization
         self.W_dec: Float[Tensor, "d_hidden d_out"] = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(
@@ -115,14 +122,17 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
                     self.d_out,
                     dtype=self.dtype,
                     device=self.device,
-                )
+                ),
+                a=0,
             )
         )
 
+        # Normalize the decoder weights to have unit norms (following Anthropic's approach)
         with torch.no_grad():
-            # Anthropic normalize this to have unit columns
+            # Divide each row of W_dec by its L2 norm
             self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
 
+        # Initialize the decoder bias vector for input adjustment (b_dec) with zeros
         self.b_dec: Float[Tensor, "d_in"] = nn.Parameter(
             torch.zeros(
                 self.d_in,
@@ -131,6 +141,7 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
             )
         )
 
+        # Initialize the output bias vector (b_dec_out) for the decoder's output with zeros
         self.b_dec_out: Float[Tensor, "d_out"] = nn.Parameter(
             torch.zeros(
                 self.d_out,
@@ -139,45 +150,49 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
             )
         )
 
-        # setup hookpoints so we can easily use with transformer lens
-        self.hook_transcoder_in = transformer_lens.hook_points.HookPoint()
-        self.hook_hidden_pre = transformer_lens.hook_points.HookPoint()
-        self.hook_hidden_post = transformer_lens.hook_points.HookPoint()
-        self.hook_transcoder_out = transformer_lens.hook_points.HookPoint()
-
-        self.setup()  # Required for `HookedRootModule`s
-
-    @jaxtyped(typechecker=typechecker)
+    @typechecker  # Enforces type checking of input and output tensors at runtime
     def forward(self, x: Float[Tensor, "... d_in"]) -> TranscoderResults:
-        # move x to correct dtype
+        """
+        Perform a forward pass through the Transcoder.
+
+        Args:
+            x (Tensor): Input tensor of shape [..., d_in], where '...' represents any number of leading dimensions.
+
+        Returns:
+            TranscoderResults: An object containing the output tensor and hidden activations.
+
+        """
+        # Ensure the input tensor is of the correct data type
         x = x.to(self.dtype)
 
-        # Remove encoder bias as per Anthropic
-        transcoder_in: Float[Tensor, "... d_in"] = self.hook_transcoder_in(
-            x - self.b_dec
-        )
+        # Adjust the input by subtracting the decoder's bias term (following Anthropic's approach)
+        transcoder_in: Float[Tensor, "... d_in"] = x - self.b_dec
 
-        hidden_pre: Float[Tensor, "... d_hidden"] = self.hook_hidden_pre(
+        # Compute pre-activation values for the hidden layer (linear transformation)
+        # Using einops.einsum for clarity in tensor dimensions
+        hidden_pre: Float[Tensor, "... d_hidden"] = (
             einops.einsum(
                 transcoder_in,
                 self.W_enc,
                 "... d_in, d_in d_hidden -> ... d_hidden",
             )
-            + self.b_enc
-        )
-        hidden_activations: Float[Tensor, "... d_hidden"] = self.hook_hidden_post(
-            torch.nn.functional.relu(hidden_pre)
+            + self.b_enc  # Add the encoder bias
         )
 
-        transcoder_out: Float[Tensor, "... d_out"] = self.hook_transcoder_out(
+        # Apply ReLU activation function to introduce non-linearity
+        hidden_activations: Float[Tensor, "... d_hidden"] = F.relu(hidden_pre)
+
+        # Compute the output by applying the decoder (another linear transformation)
+        transcoder_out: Float[Tensor, "... d_out"] = (
             einops.einsum(
                 hidden_activations,
                 self.W_dec,
                 "... d_hidden, d_hidden d_out -> ... d_out",
             )
-            + self.b_dec_out
+            + self.b_dec_out  # Add the decoder's output bias
         )
 
+        # Return the results encapsulated in a TranscoderResults dataclass
         return TranscoderResults(
             transcoder_out=transcoder_out,
             hidden_activations=hidden_activations,
@@ -185,24 +200,11 @@ class Transcoder(transformer_lens.hook_points.HookedRootModule):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self) -> None:
+        """
+        Normalize the decoder weight matrix so that each neuron's weights have unit L2 norm.
+
+        This method adjusts the decoder weights in-place. It's useful to maintain the norm
+        constraints during training or when manually adjusting the model parameters.
+        """
+        # Normalize each row of W_dec to have a unit L2 norm
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-
-    @torch.no_grad()
-    def remove_gradient_parallel_to_decoder_directions(self) -> None:
-        """
-        Update grads so that they remove the parallel component
-            (d_hidden, d_in) shape
-
-        """
-
-        parallel_component: Float[Tensor, "d_hidden"] = einops.einsum(
-            self.W_dec.grad,
-            self.W_dec.data,
-            "d_hidden d_out, d_hidden d_out -> d_hidden",
-        )
-
-        self.W_dec.grad -= einops.einsum(
-            parallel_component,
-            self.W_dec.data,
-            "d_hidden, d_hidden d_out -> d_hidden d_out",
-        )
