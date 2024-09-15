@@ -1,10 +1,3 @@
-"""
-
-Most of this is from https://github.com/jacobdunefsky/transcoder_circuits/blob/master/transcoder_training/sparse_autoencoder.py which
-is in turn mostly from Authur Conmy's https://github.com/ArthurConmy/sae/blob/main/sae/model.py
-
-"""
-
 import dataclasses
 
 import einops
@@ -14,8 +7,13 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 import math
 
+import einops
 from jaxtyping import Float, jaxtyped
 from typeguard import typechecked as typechecker
+
+TranscoderIn = Float[Tensor, "... d_in"]
+TranscoderHidden = Float[Tensor, "... d_hidden"]
+TranscoderOut = Float[Tensor, "... d_out"]
 
 
 @dataclasses.dataclass
@@ -59,7 +57,11 @@ class Transcoder(nn.Module):
 
     This is largely a minimal implementation of [Transcoders Find Interpretable LLM
     Feature Circuits](https://arxiv.org/pdf/2406.11944) and the corresponding
-    codebase.
+    codebase, which can be found here:
+
+        https://github.com/jacobdunefsky/transcoder_circuits/blob/master/transcoder_training/sparse_autoencoder.py
+
+    (which is in turn mostly from Authur Conmy's https://github.com/ArthurConmy/sae/blob/main/sae/model.py)
 
     Note:
         For simplicity, we have omitted certain methods related to resampling neurons
@@ -106,7 +108,7 @@ class Transcoder(nn.Module):
         )
 
         # Initialize the encoder bias vector (b_enc) with zeros
-        self.b_enc: Float[Tensor, "d_hidden"] = nn.Parameter(
+        self.b_enc: TranscoderHidden = nn.Parameter(
             torch.zeros(
                 self.d_hidden,
                 dtype=self.dtype,
@@ -133,7 +135,7 @@ class Transcoder(nn.Module):
             self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
 
         # Initialize the decoder bias vector for input adjustment (b_dec) with zeros
-        self.b_dec: Float[Tensor, "d_in"] = nn.Parameter(
+        self.b_dec: TranscoderIn = nn.Parameter(
             torch.zeros(
                 self.d_in,
                 dtype=self.dtype,
@@ -142,7 +144,7 @@ class Transcoder(nn.Module):
         )
 
         # Initialize the output bias vector (b_dec_out) for the decoder's output with zeros
-        self.b_dec_out: Float[Tensor, "d_out"] = nn.Parameter(
+        self.b_dec_out: TranscoderOut = nn.Parameter(
             torch.zeros(
                 self.d_out,
                 dtype=self.dtype,
@@ -151,7 +153,7 @@ class Transcoder(nn.Module):
         )
 
     @typechecker  # Enforces type checking of input and output tensors at runtime
-    def forward(self, x: Float[Tensor, "... d_in"]) -> TranscoderResults:
+    def forward(self, x: TranscoderIn) -> TranscoderResults:
         """
         Perform a forward pass through the Transcoder.
 
